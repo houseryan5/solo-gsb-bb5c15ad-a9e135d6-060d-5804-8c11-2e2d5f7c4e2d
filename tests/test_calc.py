@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import unittest
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 from app.calc import RULE_ID, compute_invoice, recompute_matches
 
@@ -217,6 +217,63 @@ class DeterminismTests(unittest.TestCase):
         )
         assigned = [a["line_no"] for a in r["rounding"]["allocations"]]
         self.assertEqual(assigned, [1])
+
+
+class WorkerThreadPrecisionTests(unittest.TestCase):
+    """回归：FastAPI 工作线程的 decimal 默认精度只有 28 位。
+
+    计算不得依赖线程默认上下文：净额最小单位校验、原币/目标币税额分配与
+    结果字符串化都使用足够且一致的局部精度（大额自动加宽）。
+    """
+
+    def test_large_integer_amount_under_default_precision(self):
+        payload = {
+            "currency": "USD",
+            "lines": [line("123456789012345678901234567890", "0.10")],
+        }
+        # 模拟 FastAPI 工作线程：把当前线程精度压回默认的 28 位
+        with localcontext() as ctx:
+            ctx.prec = 28
+            r = compute_invoice(payload)
+            self.assertEqual(r["lines"][0]["net"], "123456789012345678901234567890.00")
+            self.assertEqual(r["lines"][0]["exact_tax"], "12345678901234567890123456789")
+            self.assertEqual(r["lines"][0]["tax"], "12345678901234567890123456789.00")
+            self.assertEqual(
+                r["totals"]["total_gross"], "135802467913580246791358024679.00"
+            )
+            self.assertTrue(recompute_matches(r, payload))
+
+    def test_non_minor_unit_large_amount_rejected_under_default_precision(self):
+        # 29 位有效数字且超出 USD 最小单位：必须拒绝（API 层映射为 422），
+        # 不能因精度不足被静默舍成 .00
+        with localcontext() as ctx:
+            ctx.prec = 28
+            with self.assertRaises(ValueError):
+                compute_invoice(
+                    {
+                        "currency": "USD",
+                        "lines": [line("10000000000000000000000000.001", "0.10")],
+                    }
+                )
+
+    def test_large_amount_fx_under_default_precision(self):
+        # 大额 + 跨币种：目标币净额/税额分配同样不丢精度
+        with localcontext() as ctx:
+            ctx.prec = 28
+            r = compute_invoice(
+                {
+                    "currency": "USD",
+                    "target_currency": "CNY",
+                    "exchange_rate": "7.123456",
+                    "lines": [line("100000000000000000000000000000", "0.10")],
+                }
+            )
+            self.assertEqual(
+                r["lines"][0]["converted"]["net"], "712345600000000000000000000000.00"
+            )
+            self.assertEqual(r["fx"]["total_tax"], "71234560000000000000000000000.00")
+            conv_tax_sum = sum(Decimal(l["converted"]["tax"]) for l in r["lines"])
+            self.assertEqual(conv_tax_sum, Decimal(r["fx"]["total_tax"]))
 
 
 if __name__ == "__main__":

@@ -2687,6 +2687,74 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(status, 422, bad)
             self.assertIsInstance(body["detail"], str, bad)
 
+    def test_42_large_amount_precision(self) -> None:
+        # 回归：FastAPI 工作线程的 decimal 默认精度只有 28 位，发票创建与读取
+        # 复算不得沿用线程默认上下文——非最小单位大额净额返回 422 且不写入；
+        # 合法大额可保存、读回且 recompute_matched 为 true。
+        status, before = self._request("GET", "/api/v1/invoices?page=1&page_size=1")
+        self.assertEqual(status, 200)
+
+        # 超出 USD 最小单位的大额净额（29 位有效数字）：422，且不写入任何记录
+        status, body = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD",
+             "lines": [{"net": "10000000000000000000000000.001", "tax_rate": "0.10"}]},
+        )
+        self.assertEqual(status, 422, body)
+        status, after = self._request("GET", "/api/v1/invoices?page=1&page_size=1")
+        self.assertEqual(after["total"], before["total"])
+
+        # 合法 30 位整数净额：201 保存成功，金额完整、不被截断或舍入
+        payload = {
+            "currency": "USD",
+            "lines": [{"net": "123456789012345678901234567890", "tax_rate": "0.10"}],
+        }
+        status, created = self._request("POST", "/api/v1/invoices", payload)
+        self.assertEqual(status, 201, created)
+        self.assertEqual(
+            created["lines"][0]["net"], "123456789012345678901234567890.00"
+        )
+        self.assertEqual(
+            created["lines"][0]["exact_tax"], "12345678901234567890123456789"
+        )
+        self.assertEqual(
+            created["lines"][0]["tax"], "12345678901234567890123456789.00"
+        )
+        self.assertEqual(
+            created["totals"],
+            {"currency": "USD",
+             "total_net": "123456789012345678901234567890.00",
+             "total_tax": "12345678901234567890123456789.00",
+             "total_gross": "135802467913580246791358024679.00"},
+        )
+        self.assertTrue(created["recompute_matched"])
+
+        # 读回复算：recompute_matched 仍为 true，逐行与汇总金额一致
+        status, fetched = self._request("GET", f"/api/v1/invoices/{created['id']}")
+        self.assertEqual(status, 200)
+        self.assertTrue(fetched["recompute_matched"])
+        self.assertEqual(fetched["totals"], created["totals"])
+        self.assertEqual(fetched["lines"], created["lines"])
+
+        # 大额 + 跨币种换算：目标币净额/税额分配同样不丢精度、可复算
+        status, fx = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "target_currency": "CNY", "exchange_rate": "7.123456",
+             "lines": [{"net": "100000000000000000000000000000", "tax_rate": "0.10"}]},
+        )
+        self.assertEqual(status, 201, fx)
+        self.assertEqual(
+            fx["lines"][0]["converted"]["net"], "712345600000000000000000000000.00"
+        )
+        self.assertEqual(fx["fx"]["total_tax"], "71234560000000000000000000000.00")
+        self.assertTrue(fx["recompute_matched"])
+        status, fx_fetched = self._request("GET", f"/api/v1/invoices/{fx['id']}")
+        self.assertEqual(status, 200)
+        self.assertTrue(fx_fetched["recompute_matched"])
+        self.assertEqual(fx_fetched["fx"], fx["fx"])
+
 
 if __name__ == "__main__":
     unittest.main()
