@@ -2,8 +2,11 @@
 
 规则（固定且可复算）：
 
-1. 每行税额 = 不含税净额 × 税率，全程使用 ``Decimal`` 高精度运算（精度 50 位），
-   不出现任何 float。
+1. 每行税额 = 不含税净额 × 税率，全程使用 ``Decimal`` 高精度运算，
+   不出现任何 float。所有十进制运算都在**按本次输入量级计算的局部精度**
+   （``localcontext``）内进行：``Decimal`` 上下文是线程本地的，模块导入时
+   设置的全局精度管不到 FastAPI 工作线程（那里回落到默认 28 位），因此
+   本模块不读不写全局上下文，任何线程下结果一致。
 2. 每行含税 / 税额按 **币种最小单位** 做 ``ROUND_HALF_UP``（四舍五入）。
 3. 发票总税额 = Σ(各行精确税额) 后，再按币种最小单位做 HALF_UP；
    它与「各行已舍入税额之和」之间的差即为 *残差*（最小单位整数个，
@@ -27,15 +30,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP, localcontext, getcontext
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from typing import Any, Iterable
 
 from .currency import UnknownCurrencyError, currency_digits
 
-# 全程高精度，避免中间过程被截断
-getcontext().prec = 50
-
 RULE_ID = "half_up_plus_largest_remainder_v1"
+
+# 局部精度下限：常规金额沿用历史精度 50 位；超大金额按输入量级自动放大
+# （见 _sufficient_prec）
+_BASE_PREC = 50
 
 _ZERO = Decimal("0")
 _QUANT_CACHE: dict[int, Decimal] = {}
@@ -204,10 +208,57 @@ def _validate_lines(raw_lines: Iterable[Any]) -> list[tuple[str | None, Decimal,
     return result
 
 
+def _decimal_span(value: Decimal) -> int:
+    """非零十进制数从最高整数位到最低小数位完整展开所需的位数。
+
+    例如 100.00 -> 5、0.001 -> 3、1E+30 -> 31。用于估算局部精度上界。
+    """
+
+    if not value.is_finite() or value.is_zero():
+        return 1
+    integer_digits = max(value.adjusted() + 1, 0)        # 整数部分位数（纯小数为 0）
+    fraction_digits = max(-value.as_tuple().exponent, 0)  # 小数部分深度
+    return integer_digits + fraction_digits
+
+
+def _sufficient_prec(
+    lines_in: list[tuple[str | None, Decimal, Decimal]],
+    exchange_rate_raw: Any,
+    n_lines: int,
+) -> int:
+    """按本次输入的实际量级计算「足够」的局部精度（与线程无关）。
+
+    记 span 为各输入（净额/税率/汇率）完整展开位数的上界，则：
+
+    * 净额 × 税率（× 汇率）连乘：有效数字不超过 3 × span；
+    * 逐行求和：整数位最多再进 log10(n) 位，小数深度不超过 3 × span，
+      合计完整展开不超过 6 × span + 行数位数；
+    * 按币种最小单位 quantize 最多再需 4 位（币种小数位上限 0~4）。
+
+    取 max(50, 6 × span + 行数位数 + 16)：常规金额维持历史精度 50，
+    超大金额（如 30 位整数净额）自动放大，保证所有中间结果精确、不被截断。
+    汇率仅做尽力解析（非法值由后续正常校验流程报出），此处只为估算精度。
+    """
+
+    span = 1
+    for _description, net, rate in lines_in:
+        span = max(span, _decimal_span(net), _decimal_span(rate))
+    if exchange_rate_raw is not None:
+        try:
+            span = max(
+                span, _decimal_span(to_decimal(exchange_rate_raw, "exchange_rate"))
+            )
+        except ValueError:
+            pass
+    return max(_BASE_PREC, 6 * span + len(str(n_lines)) + 16)
+
+
 def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
     """执行完整计算，返回可直接 JSON 序列化（金额全部为字符串）的结果字典。
 
     该函数是纯函数：同样输入必然得到同样输出，持久化与复算都以它为准。
+    不读不写全局 Decimal 上下文，任何线程（含默认 28 位精度的 FastAPI
+    工作线程）下结果一致。
     """
 
     currency = str(payload["currency"]).strip().upper()
@@ -221,23 +272,26 @@ def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
     lines_in = _validate_lines(payload.get("lines", []))
     n = len(lines_in)
 
-    # 净额必须是币种最小单位的整数倍（发票上不存在更小单位）；
-    # 通过后统一 quantize 一次，使展示/存储固定为币种位数（1.5 -> 1.50）
-    unit = _unit(digits)
-    nets: list[Decimal] = []
-    normalized_lines: list[tuple[str | None, Decimal, Decimal]] = []
-    for idx, (description, net, rate) in enumerate(lines_in, start=1):
-        if (net / unit) != (net / unit).to_integral_value():
-            raise ValueError(
-                f"lines[{idx}].net={_s(net)} 不是 {currency} 最小单位 {_s(unit)} 的整数倍"
-            )
-        net = net.quantize(unit)
-        nets.append(net)
-        normalized_lines.append((description, net, rate))
-    lines_in = normalized_lines
-
+    # Decimal 上下文是线程本地的：FastAPI 工作线程拿到的是默认 28 位精度，
+    # 模块级全局设置管不到它。净额最小单位校验、原币/目标币税额分配与结果
+    # 组装全部放进同一个按输入量级计算的局部上下文，任何线程下结果一致。
     with localcontext() as ctx:
-        ctx.prec = 50
+        ctx.prec = _sufficient_prec(lines_in, payload.get("exchange_rate"), n)
+
+        # 净额必须是币种最小单位的整数倍（发票上不存在更小单位）；
+        # 通过后统一 quantize 一次，使展示/存储固定为币种位数（1.5 -> 1.50）
+        unit = _unit(digits)
+        nets: list[Decimal] = []
+        normalized_lines: list[tuple[str | None, Decimal, Decimal]] = []
+        for idx, (description, net, rate) in enumerate(lines_in, start=1):
+            if (net / unit) != (net / unit).to_integral_value():
+                raise ValueError(
+                    f"lines[{idx}].net={_s(net)} 不是 {currency} 最小单位 {_s(unit)} 的整数倍"
+                )
+            net = net.quantize(unit)
+            nets.append(net)
+            normalized_lines.append((description, net, rate))
+        lines_in = normalized_lines
 
         exact_taxes = [nets[i] * lines_in[i][2] for i in range(n)]
         alloc = _allocate(nets, exact_taxes, digits)
@@ -287,51 +341,53 @@ def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
                 "allocations": converted_alloc.allocations,
             }
 
-    result_lines: list[dict[str, Any]] = []
-    for i, (description, net, rate) in enumerate(lines_in):
-        line_out: dict[str, Any] = {
-            "line_no": i + 1,
-            "description": description,
-            "tax_rate": _s(rate),
-            "currency": currency,
-            "net": _s(net),
-            "exact_tax": _canon(exact_taxes[i]),
-            "tax": _s(alloc.rounded_taxes[i]),
-            "gross": _s(alloc.line_totals[i]),
-        }
-        if converted_alloc is not None:
-            line_out["converted"] = {
-                "currency": target_currency,
-                "net": _s(converted_nets[i]),
-                "tax": _s(converted_alloc.rounded_taxes[i]),
-                "gross": _s(
-                    converted_nets[i] + converted_alloc.rounded_taxes[i]
-                ),
+        # 结果组装也包含十进制运算（_canon 的 -0 归一与 normalize、目标币行
+        # 含税合计），必须留在局部上下文内，避免被工作线程的 28 位精度截断。
+        result_lines: list[dict[str, Any]] = []
+        for i, (description, net, rate) in enumerate(lines_in):
+            line_out: dict[str, Any] = {
+                "line_no": i + 1,
+                "description": description,
+                "tax_rate": _s(rate),
+                "currency": currency,
+                "net": _s(net),
+                "exact_tax": _canon(exact_taxes[i]),
+                "tax": _s(alloc.rounded_taxes[i]),
+                "gross": _s(alloc.line_totals[i]),
             }
-        result_lines.append(line_out)
+            if converted_alloc is not None:
+                line_out["converted"] = {
+                    "currency": target_currency,
+                    "net": _s(converted_nets[i]),
+                    "tax": _s(converted_alloc.rounded_taxes[i]),
+                    "gross": _s(
+                        converted_nets[i] + converted_alloc.rounded_taxes[i]
+                    ),
+                }
+            result_lines.append(line_out)
 
-    result: dict[str, Any] = {
-        "rule_id": RULE_ID,
-        "currency": currency,
-        "currency_digits": digits,
-        "lines": result_lines,
-        "totals": {
+        result: dict[str, Any] = {
+            "rule_id": RULE_ID,
             "currency": currency,
-            "total_net": _s(alloc.total_net),
-            "total_tax": _s(alloc.total_tax),
-            "total_gross": _s(alloc.total_gross),
-        },
-        "rounding": {
-            "mode": "ROUND_HALF_UP",
-            "minor_unit": alloc.residual_unit,
-            "residual_units": alloc.residual,
-            "residual_amount": _s(alloc.residual * _unit(digits)),
-            "method": "largest_remainder",
-            "allocations": alloc.allocations,
-        },
-    }
-    if fx_section is not None:
-        result["fx"] = fx_section
+            "currency_digits": digits,
+            "lines": result_lines,
+            "totals": {
+                "currency": currency,
+                "total_net": _s(alloc.total_net),
+                "total_tax": _s(alloc.total_tax),
+                "total_gross": _s(alloc.total_gross),
+            },
+            "rounding": {
+                "mode": "ROUND_HALF_UP",
+                "minor_unit": alloc.residual_unit,
+                "residual_units": alloc.residual,
+                "residual_amount": _s(alloc.residual * _unit(digits)),
+                "method": "largest_remainder",
+                "allocations": alloc.allocations,
+            },
+        }
+        if fx_section is not None:
+            result["fx"] = fx_section
     return result
 
 

@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 
 from app.calc import RULE_ID, compute_invoice, recompute_matches
 
@@ -217,6 +218,106 @@ class DeterminismTests(unittest.TestCase):
         )
         assigned = [a["line_no"] for a in r["rounding"]["allocations"]]
         self.assertEqual(assigned, [1])
+
+
+class LocalPrecisionTests(unittest.TestCase):
+    """局部精度：计算结果不依赖调用线程的全局 Decimal 上下文。
+
+    Decimal 上下文是线程本地的，FastAPI 工作线程拿到的是默认 28 位精度；
+    compute_invoice 必须自带按输入量级计算的足够局部精度，任何线程下
+    结果一致（含超大金额）。
+    """
+
+    BIG_NET = "100000000000000000000000000000.00"  # 30 位整数 + 2 位小数
+
+    def _run_in_fresh_thread(self, fn):
+        """在全新线程（Decimal 上下文为默认 28 位精度）中执行 fn。"""
+
+        box: dict = {}
+
+        def runner() -> None:
+            try:
+                box["result"] = fn()
+            except Exception as exc:  # 测试需要把异常带回主线程断言
+                box["error"] = exc
+
+        t = threading.Thread(target=runner)
+        t.start()
+        t.join()
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    def test_non_minor_unit_huge_net_rejected_in_worker_thread(self):
+        # 26 位整数 + 3 位小数：28 位默认精度下 net/unit 的除法会把 .001 舍没，
+        # 局部精度必须保证最小单位校验精确 -> 仍然拒绝（API 层映射 422）
+        payload = {
+            "currency": "USD",
+            "lines": [line("10000000000000000000000000.001", "0.10")],
+        }
+        with self.assertRaises(ValueError):
+            self._run_in_fresh_thread(lambda: compute_invoice(payload))
+
+    def test_huge_30_digit_net_exact_in_worker_thread(self):
+        payload = {"currency": "USD", "lines": [line(self.BIG_NET, "0.10")]}
+        r = self._run_in_fresh_thread(lambda: compute_invoice(payload))
+        self.assertEqual(r["lines"][0]["net"], self.BIG_NET)
+        self.assertEqual(r["lines"][0]["exact_tax"], "10000000000000000000000000000")
+        self.assertEqual(r["lines"][0]["tax"], "10000000000000000000000000000.00")
+        self.assertEqual(r["totals"]["total_net"], "100000000000000000000000000000.00")
+        self.assertEqual(r["totals"]["total_tax"], "10000000000000000000000000000.00")
+        self.assertEqual(r["totals"]["total_gross"], "110000000000000000000000000000.00")
+        self.assertTrue(
+            self._run_in_fresh_thread(lambda: recompute_matches(r, payload))
+        )
+
+    def test_huge_net_with_long_rate_beyond_50_digits(self):
+        # 30 位整数净额 × 31 位有效数字税率：精确税额近 60 位，
+        # 固定 50 位精度也会被截断，局部精度必须随输入放大
+        rate = "0.123456789012345678901234567890"
+        payload = {"currency": "USD", "lines": [line(self.BIG_NET, rate)]}
+        r = self._run_in_fresh_thread(lambda: compute_invoice(payload))
+        with localcontext() as ctx:
+            ctx.prec = 200
+            expected_exact = Decimal(self.BIG_NET) * Decimal(rate)
+            expected_tax = expected_exact.quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        self.assertEqual(Decimal(r["lines"][0]["exact_tax"]), expected_exact)
+        self.assertEqual(Decimal(r["totals"]["total_tax"]), expected_tax)
+        self.assertTrue(recompute_matches(r, payload))
+
+    def test_huge_net_fx_exact_in_worker_thread(self):
+        payload = {
+            "currency": "USD",
+            "target_currency": "JPY",
+            "exchange_rate": "150",
+            "lines": [line(self.BIG_NET, "0.10")],
+        }
+        r = self._run_in_fresh_thread(lambda: compute_invoice(payload))
+        self.assertEqual(
+            r["lines"][0]["converted"]["net"], "15000000000000000000000000000000"
+        )
+        self.assertEqual(
+            r["lines"][0]["converted"]["tax"], "1500000000000000000000000000000"
+        )
+        self.assertEqual(r["fx"]["total_net"], "15000000000000000000000000000000")
+        self.assertEqual(r["fx"]["total_tax"], "1500000000000000000000000000000")
+        self.assertEqual(r["fx"]["residual_units"], 0)
+        self.assertTrue(
+            self._run_in_fresh_thread(lambda: recompute_matches(r, payload))
+        )
+
+    def test_same_result_in_any_thread(self):
+        payload = {
+            "currency": "USD",
+            "target_currency": "CNY",
+            "exchange_rate": "7.123456",
+            "lines": [line(self.BIG_NET, "0.13"), line("9.99", "0.06")],
+        }
+        r_main = compute_invoice(payload)
+        r_worker = self._run_in_fresh_thread(lambda: compute_invoice(payload))
+        self.assertEqual(r_main, r_worker)
 
 
 if __name__ == "__main__":
